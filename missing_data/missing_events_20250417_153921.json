@@ -1,0 +1,92 @@
+{
+  "timestamp": "2025-04-17T15:39:21+05:30",
+  "total_count": 6,
+  "by_collection": {
+    "connection": [
+      {
+        "id": "17386928056217323744021",
+        "entity_type": "connection",
+        "entity_code": "0",
+        "event_name": "DASHBOARD_ENTRY",
+        "uuid": "d3eecc9e-8f6d-52a9-a132-f55ec7e4f399",
+        "session_id": "web-17386928031699464630497"
+      },
+      {
+        "id": "17386994805845253216312",
+        "entity_type": "connection",
+        "entity_code": "0",
+        "event_name": "DASHBOARD_ENTRY",
+        "uuid": "d3eecc9e-8f6d-52a9-a132-f55ec7e4f399",
+        "session_id": "web-17386994779174717653677"
+      }
+    ],
+    "other": [
+      {
+        "id": "17386928050768326551430",
+        "entity_type": "other",
+        "entity_code": "0",
+        "event_name": "APP_PERMISSIONS",
+        "uuid": "d3eecc9e-8f6d-52a9-a132-f55ec7e4f399",
+        "session_id": "web-17386928031699464630497"
+      },
+      {
+        "id": "17386970745200026517531",
+        "entity_type": "other",
+        "entity_code": "0",
+        "event_name": "APP_PERMISSIONS",
+        "uuid": "d3eecc9e-8f6d-52a9-a132-f55ec7e4f399",
+        "session_id": "web-17386970724940362810200"
+      },
+      {
+        "id": "17386994801855281731780",
+        "entity_type": "other",
+        "entity_code": "0",
+        "event_name": "APP_PERMISSIONS",
+        "uuid": "d3eecc9e-8f6d-52a9-a132-f55ec7e4f399",
+        "session_id": "web-17386994779174717653677"
+      },
+      {
+        "id": "17387370064204351857517",
+        "entity_type": "other",
+        "entity_code": "0",
+        "event_name": "APP_PERMISSIONS",
+        "uuid": "d3eecc9e-8f6d-52a9-a132-f55ec7e4f399",
+        "session_id": "web-17387370035143699525080"
+      }
+    ]
+  },
+  "errors": [
+    "Error checking 6134495470 in : empty entity_type",
+    "Error checking 2615214092 in : empty entity_type",
+    "Error checking 8430299925 in : empty entity_type",
+    "Error checking 4403364191 in : empty entity_type",
+    "Error checking 1666803202 in : empty entity_type",
+    "Error checking 7778653829 in : empty entity_type",
+    "Error checking 17387018814879455592556 in : empty entity_type",
+    "Error checking 6614751852 in : empty entity_type",
+    "Error checking 17387370035240403890833 in : empty entity_type",
+    "Error checking 0073894177 in : empty entity_type",
+    "Error checking 4893889358 in : empty entity_type",
+    "Error checking 3916644468 in : empty entity_type",
+    "Error checking 1041106523 in : empty entity_type",
+    "Error checking 1020979801 in : empty entity_type",
+    "Error checking 6829020663 in : empty entity_type",
+    "Error checking 17386970725227304012193 in : empty entity_type",
+    "Error checking 0935117608 in : empty entity_type",
+    "Error checking 5169642070 in : empty entity_type",
+    "Error checking 17386994779951217597159 in : empty entity_type",
+    "Error checking 9910669972 in : empty entity_type",
+    "Error checking 1063040004 in : empty entity_type",
+    "Error checking 2682363953 in : empty entity_type",
+    "Error checking 2189573517 in : empty entity_type",
+    "Error checking 8653581913 in : empty entity_type",
+    "Error checking 17386928032023100869468 in : empty entity_type",
+    "Error checking 9587642260 in : empty entity_type",
+    "Error checking 7580585656 in : empty entity_type",
+    "Error checking 4908051671 in : empty entity_type",
+    "Error checking 2793312184 in : empty entity_type",
+    "Error checking 6784888001 in : empty entity_type",
+    "Error checking 7313709165 in : empty entity_type",
+    "Error checking 1840827880 in : empty entity_type"
+  ]
+}
