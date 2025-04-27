@@ -2,8 +2,11 @@ package validator
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"log"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,72 +14,181 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"analytics/db"
 	"analytics/models"
 )
 
-// ProcessEventsInDocument processes all events in a document with concurrency control
-func ProcessEventsInDocument(db *mongo.Database, events []models.Event, timeoutSec int, maxConcurrent int, documentIndex int) []models.Result {
-	var results []models.Result
-	var resultsMutex sync.Mutex // To safely append to results from multiple goroutines
+const (
+	maxRetries       = 2
+	retryBackoffBase = time.Second
+	minEntityTypeLen = 1
+)
 
-	// Create a semaphore to limit concurrency
-	semaphore := make(chan struct{}, maxConcurrent)
+func ProcessEventsInDocument(
+	db *mongo.Database,
+	events []models.Event,
+	timeoutSec int,
+	maxConcurrent int,
+	documentIndex int,
+) []models.Result {
+	if len(events) == 0 {
+		log.Println("Warning: No events to process")
+		return nil
+	}
+
+	results := make([]models.Result, 0, len(events))
+	resultsChan := make(chan models.Result, len(events))
+	workerPool := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
 
-	// Process each event
 	for _, event := range events {
 		wg.Add(1)
-		semaphore <- struct{}{} // Acquire a spot in the semaphore
-
 		go func(evt models.Event) {
 			defer wg.Done()
-			defer func() { <-semaphore }() // Release the semaphore spot when done
+			workerPool <- struct{}{}
+			defer func() { <-workerPool }()
 
-			// Process the event with retry logic
-			var result models.Result
-
-			// Try up to 2 times with increasing timeout
-			for attempt := 1; attempt <= 2; attempt++ {
-				// Use longer timeout for retries
-				attemptTimeout := timeoutSec * attempt
-				result = validateEvent(db, evt, attemptTimeout)
-
-				//set the document index in the result
-				result.OffsetID = documentIndex
-
-				// If successful or error is not timeout related, break
-				if result.Error == nil || !isTimeoutError(result.Error) {
-					break
-				}
-
-				fmt.Printf("Attempt %d failed for event %s: %v. Retrying...\n",
-					attempt, evt.ID, result.Error)
-				time.Sleep(time.Duration(attempt) * time.Second) // Backoff
-			}
-
-			// Add result to our results slice thread-safely
-			resultsMutex.Lock()
-			results = append(results, result)
-			resultsMutex.Unlock()
-
-			// Log the outcome
-			if result.Error != nil {
-				fmt.Printf("Error checking event %s in collection %s: %v\n",
-					result.EventID, result.CollectionName, result.Error)
-			} else if result.FoundInDest {
-				fmt.Printf("✅ Event %s found in %s collection\n", result.EventID, result.CollectionName)
-			} else {
-				fmt.Printf("❌ Event %s NOT found in %s collection\n", result.EventID, result.CollectionName)
-			}
+			result := processEventWithRetry(db, evt, timeoutSec, documentIndex)
+			resultsChan <- result
+			logEventProcessingResult(result)
 		}(event)
 	}
 
-	fmt.Printf("Peak goroutines during processing: %d\n", runtime.NumGoroutine())
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
 
-	// Wait for all events to be processed
-	wg.Wait()
+	for result := range resultsChan {
+		results = append(results, result)
+	}
 
-	// Count results
+	logProcessingStats(results)
+	logResourceUsage(maxConcurrent)
+	return results
+}
+
+func ProcessEventsWithMySQL(
+	mongoDB *mongo.Database,
+	mysqlDB *sql.DB,
+	events []models.Event,
+	timeoutSec int,
+	maxConcurrent int,
+	csvPath string,
+	documentIndex int,
+) []models.CombinedResult {
+	if len(events) == 0 {
+		log.Println("Warning: No events to process")
+		return nil
+	}
+
+	results := make([]models.CombinedResult, 0, len(events))
+	resultsChan := make(chan models.CombinedResult, len(events))
+	workerPool := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+
+	for _, event := range events {
+		wg.Add(1)
+		go func(evt models.Event) {
+			defer wg.Done()
+			workerPool <- struct{}{}
+			defer func() { <-workerPool }()
+
+			mongoResult := processEventWithRetry(mongoDB, evt, timeoutSec, documentIndex)
+			combinedResult := db.ValidateAndCheckEvents(evt, mongoResult, mysqlDB, csvPath)
+			resultsChan <- combinedResult
+		}(event)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	for result := range resultsChan {
+		results = append(results, result)
+	}
+
+	logCombinedProcessingStats(results)
+	logResourceUsage(maxConcurrent)
+	return results
+}
+
+func processEventWithRetry(db *mongo.Database, event models.Event, timeoutSec, documentIndex int) models.Result {
+	var result models.Result
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		attemptTimeout := timeoutSec * attempt
+		result = validateEvent(db, event, attemptTimeout)
+		result.OffsetID = documentIndex
+
+		if result.Error == nil || !isTimeoutError(result.Error) {
+			return result
+		}
+
+		lastErr = result.Error
+		log.Printf("Attempt %d failed for event %s: %v. Retrying...", attempt, event.ID, lastErr)
+		time.Sleep(time.Duration(attempt) * retryBackoffBase)
+	}
+
+	result.Error = fmt.Errorf("failed after %d attempts, last error: %v", maxRetries, lastErr)
+	return result
+}
+
+func validateEvent(db *mongo.Database, event models.Event, timeoutSec int) models.Result {
+	result := models.Result{
+		EventID:        event.ID,
+		EntityType:     event.EntityType,
+		CollectionName: event.EntityType,
+		FoundInDest:    false,
+		Event:          event,
+	}
+
+	if err := validateEventFields(event); err != nil {
+		result.Error = err
+		return result
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	collection := db.Collection(event.EntityType)
+	filter := bson.M{"event.mappingId": event.ID}
+	countOptions := options.Count().SetMaxTime(time.Duration(timeoutSec) * time.Second)
+	count, err := collection.CountDocuments(ctx, filter, countOptions)
+
+	if err != nil {
+		result.Error = fmt.Errorf("error querying collection: %v", err)
+		return result
+	}
+
+	result.FoundInDest = count > 0
+	return result
+}
+
+func validateEventFields(event models.Event) error {
+	if len(event.EntityType) < minEntityTypeLen {
+		return fmt.Errorf("invalid entity_type: length must be at least %d", minEntityTypeLen)
+	}
+	if event.ID == "" {
+		return fmt.Errorf("event ID cannot be empty")
+	}
+	return nil
+}
+
+func logEventProcessingResult(result models.Result) {
+	if result.Error != nil {
+		log.Printf("Error checking event %s in collection %s: %v",
+			result.EventID, result.CollectionName, result.Error)
+	} else if result.FoundInDest {
+		// log.Printf("✅ Event %s found in %s collection", result.EventID, result.CollectionName)
+	} else {
+		log.Printf("❌ Event %s NOT found in %s collection", result.EventID, result.CollectionName)
+	}
+}
+
+func logProcessingStats(results []models.Result) {
 	var found, notFound, errored int
 	for _, result := range results {
 		if result.Error != nil {
@@ -87,284 +199,53 @@ func ProcessEventsInDocument(db *mongo.Database, events []models.Event, timeoutS
 			notFound++
 		}
 	}
-
-	fmt.Printf("Summary: %d events found, %d events not found, %d errors\n", found, notFound, errored)
-	return results
+	log.Printf("Processing Summary: %d events found, %d events not found, %d errors",
+		found, notFound, errored)
 }
 
-// validateEvent checks if an event exists in its destination collection
-func validateEvent(db *mongo.Database, event models.Event, timeoutSec int) models.Result {
-	// Initialize result
-	result := models.Result{
-		EventID:        event.ID,
-		EntityType:     event.EntityType,
-		CollectionName: event.EntityType, // Using entity_type as collection name
-		FoundInDest:    false,
-		Event:          event, // Store the entire event for missing data export
+func logCombinedProcessingStats(results []models.CombinedResult) {
+	var mongoFound, mongoNotFound, mysqlFound, mysqlNotFound, errors int
+	for _, result := range results {
+		// Count MongoDB results
+		if result.MongoResult.Error != nil {
+			errors++
+		} else if result.MongoResult.FoundInDest {
+			mongoFound++
+		} else {
+			mongoNotFound++
+		}
+
+		// Count MySQL results only if MongoDB validation passed and we have a mapping
+		if result.MongoResult.FoundInDest && result.MySQLResult != nil {
+			// Skip "no mapping found" as it's not an error
+			if result.MySQLResult.Error != nil {
+				if !strings.Contains(result.MySQLResult.Error.Error(), "no mapping found") {
+					errors++
+				}
+				continue
+			}
+
+			if result.MySQLResult.Found {
+				mysqlFound++
+			} else {
+				mysqlNotFound++
+			}
+		}
 	}
 
-	// Skip if entity_type is empty or invalid
-	if event.EntityType == "" {
-		result.Error = fmt.Errorf("empty entity_type")
-		return result
-	}
-
-	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
-	// Get the destination collection
-	collection := db.Collection(event.EntityType)
-
-	// Query the collection for the event ID
-	filter := bson.M{"event.mappingId": event.ID}
-
-	// Use CountDocuments with timeout options
-	countOptions := options.Count().
-		SetMaxTime(time.Duration(timeoutSec) * time.Second)
-
-	count, err := collection.CountDocuments(ctx, filter, countOptions)
-	if err != nil {
-		result.Error = err
-		return result
-	}
-
-	// If count > 0, the document exists
-	result.FoundInDest = count > 0
-	return result
+	log.Printf("Combined Processing Summary:\nMongoDB: %d found, %d not found\nMySQL: %d found, %d not found\nErrors: %d",
+		mongoFound, mongoNotFound, mysqlFound, mysqlNotFound, errors)
 }
 
-// Check if an error is timeout related
+func logResourceUsage(maxConcurrent int) {
+	log.Printf("Resource Usage:\nMax Concurrent Workers: %d\nCurrent Goroutines: %d",
+		maxConcurrent, runtime.NumGoroutine())
+}
+
 func isTimeoutError(err error) bool {
-	errMsg := err.Error()
-	return (errMsg != "" &&
-		(contains(errMsg, "deadline exceeded") ||
-			contains(errMsg, "timed out") ||
-			contains(errMsg, "timeout")))
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "timeout") ||
+		strings.Contains(err.Error(), "deadline exceeded")
 }
-
-// Simple string contains helper
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && s[:(len(s)-len(substr)+1)] != substr
-}
-
-// package validator
-//
-// import (
-// 	"context"
-// 	"database/sql"
-// 	"fmt"
-// 	"runtime"
-// 	"sync"
-// 	"time"
-//
-// 	"go.mongodb.org/mongo-driver/bson"
-// 	"go.mongodb.org/mongo-driver/mongo"
-// 	"go.mongodb.org/mongo-driver/mongo/options"
-//
-// 	"analytics/db"
-// 	"analytics/models"
-// )
-//
-// // ProcessEventsInDocument processes all events in a document with concurrency control
-// func ProcessEventsInDocument(db *mongo.Database, events []models.Event, timeoutSec int, maxConcurrent int) []models.Result {
-// 	var results []models.Result
-// 	var resultsMutex sync.Mutex // To safely append to results from multiple goroutines
-//
-// 	// Create a semaphore to limit concurrency
-// 	semaphore := make(chan struct{}, maxConcurrent)
-// 	var wg sync.WaitGroup
-//
-// 	// Process each event
-// 	for _, event := range events {
-// 		wg.Add(1)
-// 		semaphore <- struct{}{} // Acquire a spot in the semaphore
-//
-// 		go func(evt models.Event) {
-// 			defer wg.Done()
-// 			defer func() { <-semaphore }() // Release the semaphore spot when done
-//
-// 			// Process the event with retry logic
-// 			var result models.Result
-//
-// 			// Try up to 2 times with increasing timeout
-// 			for attempt := 1; attempt <= 2; attempt++ {
-// 				// Use longer timeout for retries
-// 				attemptTimeout := timeoutSec * attempt
-// 				result = validateEvent(db, evt, attemptTimeout)
-//
-// 				// If successful or error is not timeout related, break
-// 				if result.Error == nil || !isTimeoutError(result.Error) {
-// 					break
-// 				}
-//
-// 				fmt.Printf("Attempt %d failed for event %s: %v. Retrying...\n",
-// 					attempt, evt.ID, result.Error)
-// 				time.Sleep(time.Duration(attempt) * time.Second) // Backoff
-// 			}
-//
-// 			// Add result to our results slice thread-safely
-// 			resultsMutex.Lock()
-// 			results = append(results, result)
-// 			resultsMutex.Unlock()
-//
-// 			// Log the outcome
-// 			if result.Error != nil {
-// 				fmt.Printf("Error checking event %s in collection %s: %v\n",
-// 					result.EventID, result.CollectionName, result.Error)
-// 			} else if result.FoundInDest {
-// 				fmt.Printf("✅ Event %s found in %s collection\n", result.EventID, result.CollectionName)
-// 			} else {
-// 				fmt.Printf("❌ Event %s NOT found in %s collection\n", result.EventID, result.CollectionName)
-// 			}
-// 		}(event)
-// 	}
-//
-// 	fmt.Printf("Peak goroutines during processing: %d\n", runtime.NumGoroutine())
-//
-// 	// Wait for all events to be processed
-// 	wg.Wait()
-//
-// 	// Count results
-// 	var found, notFound, errored int
-// 	for _, result := range results {
-// 		if result.Error != nil {
-// 			errored++
-// 		} else if result.FoundInDest {
-// 			found++
-// 		} else {
-// 			notFound++
-// 		}
-// 	}
-//
-// 	fmt.Printf("Summary: %d events found, %d events not found, %d errors\n", found, notFound, errored)
-// 	return results
-// }
-//
-// // ProcessEventsWithMySQL processes events in both MongoDB and MySQL
-// func ProcessEventsWithMySQL(
-// 	mongoDB *mongo.Database,
-// 	mysqlDB *sql.DB,
-// 	events []models.Event,
-// 	timeoutSec int,
-// 	maxConcurrent int,
-// 	collectionMap db.EventCollectionMap,
-// 	eventNameMap db.EventNameMap,
-// ) []models.CombinedResult {
-// 	var combinedResults []models.CombinedResult
-// 	var resultsMutex sync.Mutex // To safely append to results from multiple goroutines
-//
-// 	// Create a semaphore to limit concurrency
-// 	semaphore := make(chan struct{}, maxConcurrent)
-// 	var wg sync.WaitGroup
-//
-// 	// Process each event
-// 	for _, event := range events {
-// 		wg.Add(1)
-// 		semaphore <- struct{}{} // Acquire a spot in the semaphore
-//
-// 		go func(evt models.Event) {
-// 			defer wg.Done()
-// 			defer func() { <-semaphore }() // Release the semaphore spot when done
-//
-// 			// First validate in MongoDB
-// 			mongoResult := validateEvent(mongoDB, evt, timeoutSec)
-//
-// 			// Then check in MySQL if needed
-// 			combinedResult := db.ValidateAndCheckEvents(evt, mongoResult, mysqlDB, collectionMap, eventNameMap)
-//
-// 			// Add result to our results slice thread-safely
-// 			resultsMutex.Lock()
-// 			combinedResults = append(combinedResults, combinedResult)
-// 			resultsMutex.Unlock()
-// 		}(event)
-// 	}
-//
-// 	// Wait for all events to be processed
-// 	wg.Wait()
-//
-// 	// Count results
-// 	var mongoFound, mongoNotFound, mysqlFound, mysqlNotFound, errored int
-// 	for _, result := range combinedResults {
-// 		if result.MongoResult.Error != nil {
-// 			errored++
-// 			continue
-// 		}
-//
-// 		if result.MongoResult.FoundInDest {
-// 			mongoFound++
-// 		} else {
-// 			mongoNotFound++
-// 		}
-//
-// 		if result.MySQLResult != nil {
-// 			if result.MySQLResult.Error != nil {
-// 				errored++
-// 			} else if result.MySQLResult.Found {
-// 				mysqlFound++
-// 			} else {
-// 				mysqlNotFound++
-// 			}
-// 		}
-// 	}
-//
-// 	fmt.Printf("Summary: MongoDB: %d found, %d not found; MySQL: %d found, %d not found; %d errors\n",
-// 		mongoFound, mongoNotFound, mysqlFound, mysqlNotFound, errored)
-// 	return combinedResults
-// }
-//
-// // validateEvent checks if an event exists in its destination collection
-// func validateEvent(db *mongo.Database, event models.Event, timeoutSec int) models.Result {
-// 	// Initialize result
-// 	result := models.Result{
-// 		EventID:        event.ID,
-// 		EntityType:     event.EntityType,
-// 		CollectionName: event.EntityType, // Using entity_type as collection name
-// 		FoundInDest:    false,
-// 		Event:          event, // Store the entire event for missing data export
-// 	}
-//
-// 	// Skip if entity_type is empty or invalid
-// 	if event.EntityType == "" {
-// 		result.Error = fmt.Errorf("empty entity_type")
-// 		return result
-// 	}
-//
-// 	// Create a context with timeout
-// 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
-// 	defer cancel()
-//
-// 	// Get the destination collection
-// 	collection := db.Collection(event.EntityType)
-//
-// 	// Query the collection for the event ID
-// 	filter := bson.M{"event.mappingId": event.ID}
-//
-// 	// Use CountDocuments with timeout options
-// 	countOptions := options.Count().
-// 		SetMaxTime(time.Duration(timeoutSec) * time.Second)
-//
-// 	count, err := collection.CountDocuments(ctx, filter, countOptions)
-// 	if err != nil {
-// 		result.Error = err
-// 		return result
-// 	}
-//
-// 	// If count > 0, the document exists
-// 	result.FoundInDest = count > 0
-// 	return result
-// }
-//
-// // Check if an error is timeout related
-// func isTimeoutError(err error) bool {
-// 	errMsg := err.Error()
-// 	return (errMsg != "" &&
-// 		(contains(errMsg, "deadline exceeded") ||
-// 			contains(errMsg, "timed out") ||
-// 			contains(errMsg, "timeout")))
-// }
-//
-// // Simple string contains helper
-// func contains(s, substr string) bool {
-// 	return len(s) >= len(substr) && s[:(len(s)-len(substr)+1)] != substr
-// }

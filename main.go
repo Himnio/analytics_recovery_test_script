@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"runtime"
+	"strings"
 	"time"
 
 	"analytics/config"
@@ -16,166 +18,178 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
-func main() {
-	// Define and parse configuration
-	cfg := config.ParseFlags()
+const (
+	mongoDisconnectTimeout = 10 * time.Second
+	eventMappingCSVPath    = "./csv/Docquity1.0.csv"
+)
 
-	// Print configuration
+// main is the entry point of the application that coordinates the data recovery and validation process
+func main() {
+	// Initialize logging
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	// Parse configuration
+	cfg := config.ParseFlags()
 	printConfiguration(cfg)
 
-	// Connect to MongoDB
+	// Initialize database connections and defer cleanup
+	mongoClient, mongoDB := initializeMongoDB(cfg)
+	defer cleanupMongoDB(mongoClient)
+
+	var mysqlDB *sql.DB
+	if cfg.EnableMySQL {
+		mysqlDB = initializeMySQL(cfg)
+		defer mysqlDB.Close()
+	}
+
+	// Process event recoveries
+	processEventRecoveries(cfg, mongoDB, mysqlDB)
+}
+
+// initializeMongoDB establishes connection to MongoDB and returns both client and database
+func initializeMongoDB(cfg *config.Configuration) (*mongo.Client, *mongo.Database) {
 	client, err := db.ConnectMongoDB(cfg.MongoURI, cfg.ConnectionTimeout)
 	if err != nil {
 		log.Fatalf("Failed to connect to MongoDB: %v", err)
 	}
-	// Properly disconnect with context
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		client.Disconnect(ctx)
-	}()
+	return client, client.Database(cfg.DatabaseName)
+}
 
-	// Get database handle
-	database := client.Database(cfg.DatabaseName)
+// cleanupMongoDB gracefully disconnects from MongoDB
+func cleanupMongoDB(client *mongo.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), mongoDisconnectTimeout)
+	defer cancel()
+	if err := client.Disconnect(ctx); err != nil {
+		log.Printf("Error disconnecting from MongoDB: %v", err)
+	}
+}
 
+// initializeMySQL establishes connection to MySQL and returns the database handle
+func initializeMySQL(cfg *config.Configuration) *sql.DB {
+	mysqlConfig := db.DefultMySQLConfig()
+
+	// Validate and set MySQL DSN
+	if isEmptyDSN(mysqlConfig.DSN) {
+		if cfg.MySQLDSN != "" {
+			log.Println("Using MySQL DSN from command line arguments")
+			mysqlConfig.DSN = cfg.MySQLDSN
+		} else {
+			log.Fatal("MySQL DSN is empty. Please set DB_USER, DB_PASS, DB_HOST, DB_PORT, DB_NAME environment variables or provide a DSN via -mysql-dsn flag")
+		}
+	}
+
+	mysqlDB, err := db.ConnectMySQL(mysqlConfig)
+	if err != nil {
+		log.Fatalf("Failed to connect to MySQL: %v", err)
+	}
+	return mysqlDB
+}
+
+// isEmptyDSN checks if the MySQL DSN is empty or invalid
+func isEmptyDSN(dsn string) bool {
+	return dsn == ":@tcp(:)/" || strings.HasPrefix(dsn, "@tcp")
+}
+
+// processEventRecoveries handles the main business logic of processing and validating events
+func processEventRecoveries(
+	cfg *config.Configuration,
+	mongoDB *mongo.Database,
+	mysqlDB *sql.DB,
+) {
 	// Query event_recovery collection
-	eventRecoveries, err := db.GetEventRecoveries(database, cfg.CollectionName, cfg.DocLimit, cfg.QueryTimeout)
+	eventRecoveries, err := db.GetEventRecoveries(mongoDB, cfg.CollectionName, cfg.DocLimit, cfg.QueryTimeout)
 	if err != nil {
 		log.Fatalf("Failed to get event recoveries: %v", err)
 	}
 
-	// Process all documents
-	results := processAllDocuments(database, eventRecoveries, cfg)
+	log.Printf("Processing %d event recovery documents", len(eventRecoveries))
 
-	// Create report for missing data
-	report.CreateMissingDataReport(results)
-}
-
-func printConfiguration(cfg *config.Configuration) {
-	fmt.Printf("Configuration:\n")
-	fmt.Printf("  MongoDB URI: %s\n", cfg.MongoURI)
-	fmt.Printf("  Database: %s\n", cfg.DatabaseName)
-	fmt.Printf("  Collection: %s\n", cfg.CollectionName)
-	fmt.Printf("  Query Timeout: %d seconds\n", cfg.QueryTimeout)
-	fmt.Printf("  Connection Timeout: %d seconds\n", cfg.ConnectionTimeout)
-	fmt.Printf("  Max Concurrent Operations: %d\n", cfg.MaxConcurrent)
-	fmt.Println("  GOMAXPROCS:", runtime.GOMAXPROCS(0))
-	fmt.Println("  NumCPU:", runtime.NumCPU())
-
-	if cfg.DocLimit > 0 {
-		fmt.Printf("  Document Limit: %d\n", cfg.DocLimit)
+	if cfg.EnableMySQL {
+		results := processWithMySQL(mongoDB, mysqlDB, eventRecoveries, cfg)
+		report.CreateEnhancedMissingDataReport(results)
 	} else {
-		fmt.Printf("  Document Limit: No limit (processing all documents)\n")
+		results := processMongoOnly(mongoDB, eventRecoveries, cfg)
+		report.CreateMissingDataReport(results)
 	}
 }
 
-func processAllDocuments(db *mongo.Database, eventRecoveries []models.EventRecovery, cfg *config.Configuration) []models.Result {
-	// Collect all results from all documents
+// processWithMySQL handles event validation with both MongoDB and MySQL
+func processWithMySQL(
+	mongoDB *mongo.Database,
+	mysqlDB *sql.DB,
+	eventRecoveries []models.EventRecovery,
+	cfg *config.Configuration,
+) []models.CombinedResult {
+	var allResults []models.CombinedResult
+
+	for i, recovery := range eventRecoveries {
+		log.Printf("Processing document %d/%d with %d events...",
+			i+1, len(eventRecoveries), len(recovery.Events))
+
+		results := validator.ProcessEventsWithMySQL(
+			mongoDB,
+			mysqlDB,
+			recovery.Events,
+			cfg.QueryTimeout,
+			cfg.MaxConcurrent,
+			eventMappingCSVPath,
+			i+1,
+		)
+		allResults = append(allResults, results...)
+	}
+
+	log.Printf("Finished processing %d documents with a total of %d events",
+		len(eventRecoveries), len(allResults))
+
+	return allResults
+}
+
+// processMongoOnly handles event validation with MongoDB only
+func processMongoOnly(
+	mongoDB *mongo.Database,
+	eventRecoveries []models.EventRecovery,
+	cfg *config.Configuration,
+) []models.Result {
 	var allResults []models.Result
 
-	// Process each document
-	for docIndex, recovery := range eventRecoveries {
-		fmt.Printf("Processing document %d with %d events\n", docIndex+1, len(recovery.Events))
-		results := validator.ProcessEventsInDocument(db, recovery.Events, cfg.QueryTimeout, cfg.MaxConcurrent, docIndex+1)
+	for i, recovery := range eventRecoveries {
+		log.Printf("Processing document %d/%d with %d events",
+			i+1, len(eventRecoveries), len(recovery.Events))
+
+		results := validator.ProcessEventsInDocument(
+			mongoDB,
+			recovery.Events,
+			cfg.QueryTimeout,
+			cfg.MaxConcurrent,
+			i+1,
+		)
 		allResults = append(allResults, results...)
 	}
 
 	return allResults
 }
 
-// package main
-//
-// import (
-// 	"context"
-// 	"fmt"
-// 	"log"
-// 	"runtime"
-// 	"time"
-//
-// 	"analytics/config"
-// 	"analytics/db"
-// 	"analytics/models"
-// 	"analytics/report"
-// 	"analytics/validator"
-//
-// 	"go.mongodb.org/mongo-driver/mongo"
-// )
-//
-// func main() {
-// 	// Define and parse configuration
-// 	cfg := config.ParseFlags()
-//
-// 	// Print configuration
-// 	printConfiguration(cfg)
-//
-// 	// Connect to MongoDB
-// 	mongoClient, err := db.ConnectMongoDB(cfg.MongoURI, cfg.ConnectionTimeout)
-// 	if err != nil {
-// 		log.Fatalf("Failed to connect to MongoDB: %v", err)
-// 	}
-// 	// Properly disconnect MongoDB with context
-// 	defer func() {
-// 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-// 		defer cancel()
-// 		mongoClient.Disconnect(ctx)
-// 	}()
-//
-// 	// Connect to MySQL if enabled
-// 	var mysqlDB *db.MySQLHandler
-// 	if cfg.EnableMySQL {
-// 		mysqlConfig := db.DefaultMySQLConfig()
-// 		mysqlConfig.DSN = cfg.MySQLDSN
-//
-// 		mysqlDB, err = db.Connect(mysqlConfig)
-// 		if err != nil {
-// 			log.Fatalf("Failed to connect to MySQL: %v", err)
-// 		}
-// 		defer mysqlDB.Close()
-// 	}
-//
-// 	// Get MongoDB database handle
-// 	mongoDB := mongoClient.Database(cfg.DatabaseName)
-//
-// 	// Query event_recovery collection
-// 	eventRecoveries, err := db.GetEventRecoveries(mongoDB, cfg.CollectionName, cfg.DocLimit, cfg.QueryTimeout)
-// 	if err != nil {
-// 		log.Fatalf("Failed to get event recoveries: %v", err)
-// 	}
-//
-// 	// Initialize event name and collection maps
-// 	eventNameMap := db.DefaultEventNameMap()
-// 	collectionMap := db.DefaultEventCollectionMap()
-//
-// 	// Process all documents based on configuration
-// 	if cfg.EnableMySQL {
-// 		combinedResults := processAllDocumentsWithMySQL(mongoDB, mysqlDB.DB, eventRecoveries, cfg, eventNameMap, collectionMap)
-// 		report.CreateCombinedReport(combinedResults, eventNameMap, collectionMap)
-// 	} else {
-// 		results := processAllDocuments(mongoDB, eventRecoveries, cfg)
-// 		report.CreateMissingDataReport(results)
-// 	}
-// }
-//
-// func printConfiguration(cfg *config.Configuration) {
-// 	fmt.Printf("Configuration:\n")
-// 	fmt.Printf("  MongoDB URI: %s\n", cfg.MongoURI)
-// 	fmt.Printf("  Database: %s\n", cfg.DatabaseName)
-// 	fmt.Printf("  Collection: %s\n", cfg.CollectionName)
-// 	fmt.Printf("  Query Timeout: %d seconds\n", cfg.QueryTimeout)
-// 	fmt.Printf("  Connection Timeout: %d seconds\n", cfg.ConnectionTimeout)
-// 	fmt.Printf("  Max Concurrent Operations: %d\n", cfg.MaxConcurrent)
-// 	fmt.Printf("  MySQL Enabled: %v\n", cfg.EnableMySQL)
-// 	if cfg.EnableMySQL {
-// 		fmt.Printf("  MySQL DSN: %s\n", cfg.MySQLDSN)
-// 	}
-// 	fmt.Println("  GOMAXPROCS:", runtime.GOMAXPROCS(0))
-// 	fmt.Println("  NumCPU:", runtime.NumCPU())
-//
-// 	if cfg.DocLimit > 0 {
-// 		fmt.Printf("  Document Limit: %d\n", cfg.DocLimit)
-// 	} else {
-// 		fmt.Printf("  Document Limit: No limit (processing all documents)\n")
-// 	}
-// }
-//
-// func processAllDocuments(db *mongo.Database, eventRecoveries []models.EventRecovery, cfg *config.Configuration) []models.Result
+// printConfiguration outputs the current configuration settings
+func printConfiguration(cfg *config.Configuration) {
+	fmt.Printf("\nConfiguration:\n")
+	fmt.Printf("  MongoDB URI: %s\n", cfg.MongoURI)
+	fmt.Printf("  Database: %s\n", cfg.DatabaseName)
+	fmt.Printf("  Collection: %s\n", cfg.CollectionName)
+	fmt.Printf("  Query Timeout: %d seconds\n", cfg.QueryTimeout)
+	fmt.Printf("  Connection Timeout: %d seconds\n", cfg.ConnectionTimeout)
+	fmt.Printf("  Max Concurrent Operations: %d\n", cfg.MaxConcurrent)
+	fmt.Printf("  MySQL Enabled: %v\n", cfg.EnableMySQL)
+	if cfg.EnableMySQL {
+		fmt.Printf("  MySQL DSN: %s\n", cfg.MySQLDSN)
+	}
+	fmt.Printf("  GOMAXPROCS: %d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("  NumCPU: %d\n", runtime.NumCPU())
+	fmt.Printf("  Document Limit: %s\n\n",
+		func() string {
+			if cfg.DocLimit > 0 {
+				return fmt.Sprintf("%d", cfg.DocLimit)
+			}
+			return "No limit (processing all documents)"
+		}(),
+	)
+}

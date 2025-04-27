@@ -37,3 +37,6 @@ Thumbs.db
 
 # Environment files
 .env
+
+# missing_data
+missing_data/
