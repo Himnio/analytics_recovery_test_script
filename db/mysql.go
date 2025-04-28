@@ -102,14 +102,16 @@ func LoadEventCollectionMapFromCSV(filePath string) (EventCollectionMap, error) 
 			return nil, fmt.Errorf("error reading CSV record: %v", err)
 		}
 
-		if len(record) < 2 {
-			return nil, fmt.Errorf("invalid CSV record format: %v", record)
+		// Skip blank rows
+		if len(record) < 2 || strings.TrimSpace(record[0]) == "" || strings.TrimSpace(record[1]) == "" {
+			continue
 		}
 
-		collectionName := record[0]
-		productTypeID, err := strconv.Atoi(record[1])
+		collectionName := strings.TrimSpace(record[0])
+		productTypeID, err := strconv.Atoi(strings.TrimSpace(record[1]))
 		if err != nil {
-			return nil, fmt.Errorf("invalid product_type_id value '%s': %v", record[1], err)
+			log.Printf("Warning: Skipping row with invalid product_type_id value '%s': %v", record[1], err)
+			continue
 		}
 
 		mapping[collectionName] = productTypeID
@@ -306,6 +308,24 @@ func LoadEventMappings(csvPath string) error {
 
 	eventMappings = make([]EventMapping, 0, len(records))
 	for _, record := range records {
+		// Skip blank rows (where all fields are empty)
+		isBlankRow := true
+		for _, field := range record {
+			if strings.TrimSpace(field) != "" {
+				isBlankRow = false
+				break
+			}
+		}
+		if isBlankRow {
+			continue
+		}
+
+		// Skip if mandatory fields are empty
+		if strings.TrimSpace(record[0]) == "" || strings.TrimSpace(record[1]) == "" || strings.TrimSpace(record[2]) == "" {
+			log.Printf("Warning: Skipping row with empty mandatory fields: %v", record)
+			continue
+		}
+
 		productType, err := strconv.Atoi(record[2])
 		if err != nil {
 			log.Printf("Warning: Invalid product_type in CSV: %s", record[2])
