@@ -1,3 +1,4 @@
 old_event_name,new_event_name,product_type,current_screen_name,action_on,action_type,cta_type
 DOCTALK_DETAIL_VISIT,DETAIL_EXIT,24,,,,
 ONBOARDING_VERIFY_OTP_VISIT,EXIT,0,ONBOARDING_VERIFY_OTP,,,
+DOCTALKS_HOME_VISIT,DASHBOARD_EXIT,24,DOCTALKS_DASHBOARD,,,

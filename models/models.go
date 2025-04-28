@@ -15,6 +15,7 @@ type Event struct {
 	EventName  string      `bson:"event_name" json:"event_name"`
 	UUID       string      `bson:"uuid" json:"uuid"`
 	SessionID  string      `bson:"session_id" json:"session_id"`
+	ScreenName string      `bson:"screen_name" json:"screen_name"`
 }
 
 // Validate performs validation of Event fields
@@ -277,6 +278,7 @@ type MongoToMySQLMissingEvent struct {
 	SessionID      string      `json:"session_id"`
 	OffsetID       int         `json:"offset_id"`
 	EntityCode     interface{} `json:"entity_code"`
+	ScreenName     string      `json:"screen_name"`
 }
 
 // String returns a string representation of the MongoToMySQLMissingEvent

@@ -332,6 +332,7 @@ func CreateEnhancedMissingDataReport(results []models.CombinedResult) {
 					SessionID:      result.MongoResult.Event.SessionID,
 					OffsetID:       result.MongoResult.OffsetID,
 					EntityCode:     result.MongoResult.Event.EntityCode,
+					ScreenName:     result.MongoResult.Event.ScreenName,
 				}
 				mysqlReport.Events = append(mysqlReport.Events, mysqlEvent)
 			}
